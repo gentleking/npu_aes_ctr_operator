@@ -1,0 +1,24 @@
+[
+    {
+        "op": "AesCtrDecryptAicpu",
+        "input_desc": [
+            {
+                "format": "ND",
+                "shape": [1024],
+                "type": "uint8"
+            },
+            {
+                "format": "ND",
+                "shape": [16],
+                "type": "uint8"
+            }
+        ],
+        "output_desc": [
+            {
+                "format": "ND",
+                "shape": [1024],
+                "type": "uint8"
+            }
+        ]
+    }
+]
