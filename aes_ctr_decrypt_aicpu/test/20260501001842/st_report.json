@@ -1,0 +1,9 @@
+{
+    "run_cmd": "/usr/local/Ascend/ascend-toolkit/latest/bin/msopst run -i msopst_config.json -soc Ascend310P3",
+    "report_list": [],
+    "summary": {
+        "test case count": 0,
+        "success count": 0,
+        "failed count": 0
+    }
+}

@@ -1,0 +1,24 @@
+{
+    "case0": {
+        "op": "AesCtrDecryptAicpu",
+        "input": {
+            "ciphertext": {
+                "dtype": "uint8",
+                "shape": [1024],
+                "file": "input/ciphertext.bin"
+            },
+            "key": {
+                "dtype": "uint8",
+                "shape": [16],
+                "file": "input/key.bin"
+            }
+        },
+        "output": {
+            "plaintext": {
+                "dtype": "uint8",
+                "shape": [1024],
+                "file": "output/msopst_result.bin"
+            }
+        }
+    }
+}

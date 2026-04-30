@@ -1,0 +1,47 @@
+[
+  {
+    "op": "AesCtrCustom",
+    "input_desc": [
+      {
+        "name": "plaintext",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["uint8"]
+      },
+      {
+        "name": "key",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["uint8"]
+      },
+      {
+        "name": "iv",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["uint8"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "ciphertext",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["uint8"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "useCoreNum",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": 32
+      },
+      {
+        "name": "pipelineProcessTileBytes",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": 1024
+      }
+    ]
+  }
+]

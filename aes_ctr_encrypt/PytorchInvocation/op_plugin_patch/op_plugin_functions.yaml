@@ -1,0 +1,2 @@
+  - func: npu_aes_ctr_encrypt(Tensor plaintext, Tensor key) -> Tensor
+    op_api: all_version

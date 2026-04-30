@@ -1,0 +1,39 @@
+[
+    {
+        "op": "AesCtrEncrypt",
+        "input_desc": [
+            {
+                "name": "plaintext",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "uint8"
+                ]
+            },
+            {
+                "name": "key",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "uint8"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "cyphertext",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "uint8"
+                ]
+            }
+        ]
+    }
+]
