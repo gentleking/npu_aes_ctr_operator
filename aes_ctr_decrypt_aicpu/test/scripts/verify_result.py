@@ -16,30 +16,33 @@ AesCtrDecryptAicpu 算子执行结果验证脚本
   - 文件大小不一致时直接判定失败
 """
 import sys
-import numpy as np
+import hashlib
+
+
+def file_hash(filepath):
+    sha256 = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            sha256.update(chunk)
+    return sha256.hexdigest()
 
 
 def verify_result(output_file, golden_file):
-    """验证算子输出与 golden 值是否一致"""
+    out_hash = file_hash(output_file)
+    gd_hash = file_hash(golden_file)
 
-    # 读取算子输出和 golden 文件
-    out_data = np.fromfile(output_file, dtype=np.uint8)
-    gd_data = np.fromfile(golden_file, dtype=np.uint8)
+    print(f"  SHA256(output): {out_hash}")
+    print(f"  SHA256(golden): {gd_hash}")
 
-    # 检查尺寸是否一致
-    if out_data.shape != gd_data.shape:
-        print(f"Size mismatch: output={out_data.shape}, "
-              f"golden={gd_data.shape}")
+    if out_hash == gd_hash:
+        print("PASS: output matches golden!")
+        return True
+    else:
+        print("FAIL: output differs from golden!")
         return False
-
-    # 逐字节比较
-    diff = (out_data != gd_data).sum()
-    if diff > 0:
-        print(f"FAIL: {diff} bytes differ")
-        return False
-
-    print("PASS: output matches golden!")
-    return True
 
 
 if __name__ == '__main__':

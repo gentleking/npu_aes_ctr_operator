@@ -169,7 +169,7 @@ int main() {
     fout.write(reinterpret_cast<char*>(hostOut.data()), hostOut.size());
     fout.close();
 
-    std::cout << "Output written to output/result.bin" << std::endl;
+    std::cout << "Custom op Innovation: Output written to output/result.bin" << std::endl;
 
     // ---- 16. 资源清理 ----
     // 【重要】必须按相反顺序释放资源，防止内存泄漏
