@@ -108,6 +108,7 @@ opInfo.workspaceSize=1024
 ### 4.1 环境变量
 
 ```bash
+# 在build.sh脚本中修改环境变量
 export ASCEND_OPP_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp
 export ASCEND_AICPU_PATH=/usr/local/Ascend/ascend-toolkit/latest
 export ASCEND_TENSOR_COMPILER_INCLUDE=/usr/local/Ascend/ascend-toolkit/latest/compiler/include
@@ -123,16 +124,17 @@ export AICPU_SOC_VERSION=Ascend310P3
 > **注意**：必须使用 `-nostdinc++` 强制使用 cross-compiler GCC 7.3.0 的 C++ 头文件，避免系统 GCC 12 头文件与 AICPU 框架的 ABI 不兼容问题。
 
 ```bash
-cd AesCtrDecryptAicpu
-rm -rf build_out && mkdir build_out && cd build_out
+bash build.sh
+# cd AesCtrDecryptAicpu
+# rm -rf build_out && mkdir build_out && cd build_out
 
-cmake .. \
-  -DCMAKE_CXX_FLAGS="-nostdinc++ \
-    -isystem ${TOOLCHAIN_DIR}/aarch64-target-linux-gnu/include/c++/7.3.0 \
-    -isystem ${TOOLCHAIN_DIR}/aarch64-target-linux-gnu/include/c++/7.3.0/aarch64-target-linux-gnu \
-    -D_GLIBCXX_USE_CXX11_ABI=1"
+# cmake .. \
+#   -DCMAKE_CXX_FLAGS="-nostdinc++ \
+#     -isystem ${TOOLCHAIN_DIR}/aarch64-target-linux-gnu/include/c++/7.3.0 \
+#     -isystem ${TOOLCHAIN_DIR}/aarch64-target-linux-gnu/include/c++/7.3.0/aarch64-target-linux-gnu \
+#     -D_GLIBCXX_USE_CXX11_ABI=1"
 
-make -j$(nproc)
+# make -j$(nproc)
 ```
 
 编译成功后输出：
