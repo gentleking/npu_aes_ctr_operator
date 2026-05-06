@@ -22,7 +22,7 @@ operator-dev/
 
 ```bash
 cd aes_ctr_decrypt_aicpu/test
-bash run.sh
+bash run_op_test.sh
 ```
 
 一键完成：环境检查 → 生成测试数据 → ATC 转换 OM → 编译 → 执行 → 验证。

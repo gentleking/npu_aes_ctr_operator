@@ -36,10 +36,11 @@ operator-dev/aes_ctr_decrypt_aicpu/
 ├── test/
 │   ├── test_aclop_v2.cpp                   # C++ 调用程序（AscendCL）
 │   ├── test_aes_ctr_perf.cpp               # 性能测试程序
-│   ├── perf_test.py                        # 性能测试脚本
+│   ├── test_aes_ctr_perf_large.cpp         # 大数据量性能测试程序
+│   ├── perf_test.py                        # 性能自动化测试脚本
+│   ├── run_op_test.sh                      # 一键验证脚本（ATC→编译→执行→验证）
 │   ├── scripts/gen_data.py                 # 测试数据生成
 │   ├── scripts/verify_result.py            # 结果验证
-│   ├── run.sh                              # 一键验证脚本
 │   └── aes_ctr_decrypt_aicpu_op.json       # ATC 输入描述
 ├── README.md                               # 本文件
 └── AES_CTR_DECRYPT_AICPU_开发文档.md        # 详细开发文档
@@ -124,8 +125,8 @@ export AICPU_SOC_VERSION=Ascend310P3
 > **注意**：必须使用 `-nostdinc++` 强制使用 cross-compiler GCC 7.3.0 的 C++ 头文件，避免系统 GCC 12 头文件与 AICPU 框架的 ABI 不兼容问题。
 
 ```bash
+cd AesCtrDecryptAicpu
 bash build.sh
-# cd AesCtrDecryptAicpu
 # rm -rf build_out && mkdir build_out && cd build_out
 
 # cmake .. \

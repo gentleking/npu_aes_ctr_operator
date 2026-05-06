@@ -52,16 +52,19 @@ export OPP_CUSTOM_VENDOR=customize_aicpu
 export SYSTEM_INFO=openeuler_aarch64
 export AICPU_SOC_VERSION=$SOC_VERSION
 
-rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR"
+# rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR"
+# cd "$BUILD_DIR"
+# cmake .. \
+#   -DCMAKE_CXX_FLAGS="-nostdinc++ \
+#     -isystem ${TOOLCHAIN_DIR}/aarch64-target-linux-gnu/include/c++/7.3.0 \
+#     -isystem ${TOOLCHAIN_DIR}/aarch64-target-linux-gnu/include/c++/7.3.0/aarch64-target-linux-gnu \
+#     -D_GLIBCXX_USE_CXX11_ABI=1" 2>&1
 
+# make -j$(nproc) 2>&1
+
+cd "$AICPU_DIR"
+bash build.sh
 cd "$BUILD_DIR"
-cmake .. \
-  -DCMAKE_CXX_FLAGS="-nostdinc++ \
-    -isystem ${TOOLCHAIN_DIR}/aarch64-target-linux-gnu/include/c++/7.3.0 \
-    -isystem ${TOOLCHAIN_DIR}/aarch64-target-linux-gnu/include/c++/7.3.0/aarch64-target-linux-gnu \
-    -D_GLIBCXX_USE_CXX11_ABI=1" 2>&1
-
-make -j$(nproc) 2>&1
 
 SO_FILE=$(find "$BUILD_DIR/makepkg" -name "libaes_ctr_decrypt_aicpu.so" 2>/dev/null)
 [ -n "$SO_FILE" ] || log_fail "编译未生成 libaes_ctr_decrypt_aicpu.so"
