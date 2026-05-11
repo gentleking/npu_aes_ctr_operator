@@ -18,12 +18,8 @@
 #include <cstring>
 
  // ------------------ 常量/宏定义 ------------------
-constexpr int32_t TOTAL_LENGTH = 8 * 1024;  // 总half数量（128bits）
-constexpr int32_t USE_CORE_NUM = 8;         // 使用的核心数
-constexpr int32_t BLOCK_LENGTH = TOTAL_LENGTH / USE_CORE_NUM;
-constexpr int32_t TILE_NUM = 8;             // tile数量 8
 constexpr int32_t BUFFER_NUM = 2;           // 双缓冲数量
-constexpr int32_t TILE_LENGTH = BLOCK_LENGTH / TILE_NUM / BUFFER_NUM; // pipeline切分长度128
+constexpr int32_t TILE_LENGTH = 64;          // 每个tile的half数量（固定用于buffer分配）
  
  // AES 参数定义
  static const int AES_KEY_BYTES = 16;                                // AES-128密钥字节数
@@ -300,12 +296,8 @@ static __aicore__ void AesCtrEncrypt(const uint8_t *plaintext, uint8_t *cipherte
  */
 class KernelAesCtrDecrypt {
     public:
-        /**
-         * @brief 构造函数：初始化AES的S-box
-         */
         __aicore__ inline KernelAesCtrDecrypt()
         {
-            // 初始化 sbox 数组（固定常量）
             uint8_t sbox_init[256] = {
                 0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b,
                 0xfe, 0xd7, 0xab, 0x76, 0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0,
@@ -330,220 +322,147 @@ class KernelAesCtrDecrypt {
                 0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f,
                 0xb0, 0x54, 0xbb, 0x16
             };
-            // 将常量数组拷贝到私有成员 sbox 中
             for (int i = 0; i < 256; i++) {
                 sbox[i] = sbox_init[i];
             }
         }
-    
-        /**
-         * @brief 初始化：设置GM全局缓冲区，初始化双缓冲队列，并从GM复制密钥和IV，执行密钥扩展
-         * @param plaintext GM中存储明文的地址
-         * @param key       GM中存储AES-128密钥的地址
-         * @param iv        GM中存储初始向量(IV)的地址
-         * @param ciphertext GM中存储加密结果的地址
-         *
-         * - 通过 GlobalTensor 设置 plaintextGm、ciphertextGm 的起始地址和长度。
-         * - 调用 TPipe::InitBuffer() 初始化多缓冲队列，以实现流水线并行。
-         * - 从GM复制key、iv到本地，然后调用KeyExpansion进行密钥扩展。
-         * - 根据blockIdx对IV做偏移处理，以便多核并行时能使用不同的计数器起点。
-         */
+
         __aicore__ inline void Init(GM_ADDR plaintext, GM_ADDR key, GM_ADDR ciphertext, uint32_t totalLength, uint32_t tileNum)
         {
-            // this->USE_CORE_NUM = AscendC::GetBlockNum();
-            // this->TOTAL_LENGTH = totalLength;
-            // this->TILE_NUM = tileNum;
-            // this->BLOCK_LENGTH = this->TOTAL_LENGTH / this->USE_CORE_NUM;
-            // this->TILE_LENGTH = this->BLOCK_LENGTH / this->TILE_NUM / BUFFER_NUM;
+            int32_t blockDim = AscendC::GetBlockNum();
+            int32_t totalHalfs = static_cast<int32_t>(totalLength / 2);
+            int32_t blockIdx = AscendC::GetBlockIdx();
 
-            int blockIdx = AscendC::GetBlockIdx();
+            int32_t baseBlockLen = totalHalfs / blockDim;
+            int32_t rem = totalHalfs % blockDim;
+            int32_t startOffset = blockIdx * baseBlockLen + (blockIdx < rem ? blockIdx : rem);
+            thisBlockLen_ = baseBlockLen + (blockIdx < rem ? 1 : 0);
 
-            // 配置全局内存缓冲区
-            plaintextGm.SetGlobalBuffer((__gm__ half *)plaintext + BLOCK_LENGTH * blockIdx, BLOCK_LENGTH);
-            ciphertextGm.SetGlobalBuffer((__gm__ half *)ciphertext + BLOCK_LENGTH * blockIdx, BLOCK_LENGTH);
-    
-            // 初始化双缓冲队列
+            if (thisBlockLen_ <= 0) {
+                thisBlockLen_ = 0;
+                loopCount_ = 0;
+                return;
+            }
+
+            loopCount_ = (thisBlockLen_ + TILE_LENGTH - 1) / TILE_LENGTH;
+
+            plaintextGm.SetGlobalBuffer((__gm__ half *)plaintext + startOffset, thisBlockLen_);
+            ciphertextGm.SetGlobalBuffer((__gm__ half *)ciphertext + startOffset, thisBlockLen_);
+
             pipe.InitBuffer(inQueuePlain, BUFFER_NUM, TILE_LENGTH * sizeof(half));
             pipe.InitBuffer(outQueueCipher, BUFFER_NUM, TILE_LENGTH * sizeof(half));
-    
-            // 从GM复制密钥到localKey，并进行扩展
+
             uint8_t localKey[AES_KEY_BYTES];
             volatile __gm__ uint8_t *gm_key = key;
             for (int i = 0; i < AES_KEY_BYTES; i++) {
                 localKey[i] = gm_key[i];
             }
-    
-            // 从GM复制IV到本地IV
-            // uint8_t init_iv[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-            //                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // 用于保存初始IV状态
-     
-            // volatile __gm__ uint8_t *gm_iv = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-            //                                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // 用于保存初始IV状态;
-            // 初始化IV为全0
+
             for (int i = 0; i < AES_BLOCK_BYTES; i++) {
-                // IV[i] = gm_iv[i];
                 IV[i] = 0;
             }
-    
-            // 执行AES-128密钥扩展
+
             KeyExpansion(localKey, expandedKey, sbox);
-    
-            // 根据blockIdx调整IV，使多核处理使用不同的初始计数器
-            // (这里的offsetBlocks计算逻辑可根据实际分块大小进行修改)
-            uint32_t offsetBlocks = (BLOCK_LENGTH * 2) / AES_BLOCK_BYTES;
+
+            uint32_t offsetBlocks = static_cast<uint32_t>(startOffset / 8);
             uint8_t tmpIV[16];
             for (int i = 0; i < 16; i++) {
                 tmpIV[i] = IV[i];
             }
-            BigEndAdd(tmpIV, offsetBlocks * blockIdx);
+            BigEndAdd(tmpIV, offsetBlocks);
             for (int i = 0; i < 16; i++) {
                 IV[i] = tmpIV[i];
             }
         }
-    
-        /**
-         * @brief 处理入口：依次执行数据读入、加密计算、数据写出
-         *
-         * 其中包含TILE_NUM * BUFFER_NUM次循环，每次循环都完成一次CopyIn、Compute、CopyOut的排布。
-         * 在硬件层面，CopyIn、Compute、CopyOut三个阶段可以流水线并行执行，从而提升吞吐量。
-         */
+
         __aicore__ inline void Process()
         {
-            int loopCount = TILE_NUM * BUFFER_NUM;
-            for (int i = 0; i < loopCount; i++) {
+            if (thisBlockLen_ <= 0) return;
+            for (int i = 0; i < loopCount_; i++) {
                 CopyIn(i);
                 Compute(i);
                 CopyOut(i);
             }
         }
-    
+
     private:
-        /**
-         * @brief 数据读入：从GM复制数据到本地Tensor
-         *
-         * 流水线Stage 1：本函数对应“CopyIn”阶段，将全局内存（GM）中的数据搬运到Local Memory。
-         * - 使用 TQue 的 AllocTensor<half>() 分配一个可存储 TILE_LENGTH 大小的本地Tensor。
-         * - 使用 DataCopy() 将 GM 中的明文数据复制到本地Tensor。
-         * - 将装载了数据的本地Tensor 放入（EnQue）队列 inQueuePlain，供下一个Stage（Compute）使用。
-         *
-         * 参考官方开发手册中 “Vector+队列模式” 中对 TQue 的使用和 DataCopy 的描述。
-         */
+        __aicore__ inline int32_t GetTileLen(int32_t idx)
+        {
+            int32_t processed = idx * TILE_LENGTH;
+            int32_t remaining = thisBlockLen_ - processed;
+            return (remaining > TILE_LENGTH) ? TILE_LENGTH : (remaining > 0 ? remaining : TILE_LENGTH);
+        }
+
         __aicore__ inline void CopyIn(int idx)
         {
+            int32_t tileLen = GetTileLen(idx);
             AscendC::LocalTensor<half> plainLocal = inQueuePlain.AllocTensor<half>();
-            AscendC::DataCopy(plainLocal, plaintextGm[idx * TILE_LENGTH], TILE_LENGTH);
+            AscendC::DataCopy(plainLocal, plaintextGm[idx * TILE_LENGTH], tileLen);
             inQueuePlain.EnQue(plainLocal);
         }
-    
-        /**
-         * @brief 核心加密计算：从本地Tensor读取数据，执行AES-CTR加密，再写回加密结果到本地Tensor
-         *
-         * 流水线Stage 2：本函数对应“Compute”阶段，读取队列 inQueuePlain 中的本地Tensor，
-         * 进行AES-CTR加密，然后将结果写入另一个本地Tensor，再放入 outQueueCipher 队列，等待下一阶段输出。
-         *
-         * - DeQue() 从 inQueuePlain 中获取上一阶段传入的明文Tensor。
-         * - 分配新的本地Tensor（cipherLocal）以存放加密结果。
-         * - 进行必要的数据格式转换（half -> uint8_t 数组），再调用 AesCtrEncrypt。
-         * - 将加密结果转换回 half 并写入 cipherLocal。
-         * - EnQue() 将加密后的数据放入 outQueueCipher。
-         * - FreeTensor() 释放用完的明文Tensor 以复用本地内存。
-         *
-         * 参考官方开发手册 “流水线编程范式”的多缓冲（Double Buffer）与队列操作示例。
-         */
+
         __aicore__ inline void Compute(int idx)
         {
             int32_t blockIdx = AscendC::GetBlockIdx();
             AscendC::LocalTensor<half> plainLocal = inQueuePlain.DeQue<half>();
             AscendC::LocalTensor<half> cipherLocal = outQueueCipher.AllocTensor<half>();
-    
-            // 复制当前IV到临时缓冲区
+
+            int32_t tileLen = GetTileLen(idx);
+            int32_t tileBytes = tileLen * 2;
+
             uint8_t TmpIv[16];
             for (int i = 0; i < 16; i++) {
                 TmpIv[i] = IV[i];
             }
-            constexpr int tileBytes = TILE_LENGTH * 2;
-            uint8_t plainBuf[tileBytes];
-            // 将half格式数据转换为字节数组
-            for (int i = 0; i < TILE_LENGTH; i++) {
+            constexpr int maxTileBytes = TILE_LENGTH * 2;
+            uint8_t plainBuf[maxTileBytes];
+            for (int i = 0; i < tileLen; i++) {
                 half hVal = plainLocal.GetValue(i);
                 uint16_t halfBits = *reinterpret_cast<uint16_t *>(&hVal);
                 plainBuf[2 * i + 0] = static_cast<uint8_t>(halfBits & 0xFF);
                 plainBuf[2 * i + 1] = static_cast<uint8_t>((halfBits >> 8) & 0xFF);
             }
-    
-            // 执行AES-CTR加密
-            uint8_t cipherBuf[tileBytes];
+
+            uint8_t cipherBuf[maxTileBytes];
             AesCtrEncrypt(plainBuf, cipherBuf, tileBytes, expandedKey, TmpIv, blockIdx, sbox);
-    
-            // 更新本地IV
+
             for (int i = 0; i < 16; i++) {
                 IV[i] = TmpIv[i];
             }
-    
-            // 将加密后的字节数组转换回half格式，并写入本地Tensor
-            for (int i = 0; i < TILE_LENGTH; i++) {
+
+            for (int i = 0; i < tileLen; i++) {
                 uint16_t halfBits = static_cast<uint16_t>(cipherBuf[2 * i]) |
                                     (static_cast<uint16_t>(cipherBuf[2 * i + 1]) << 8);
                 half val = *reinterpret_cast<half *>(&halfBits);
                 cipherLocal.SetValue(i, val);
             }
-    
+
             outQueueCipher.EnQue<half>(cipherLocal);
             inQueuePlain.FreeTensor(plainLocal);
         }
-    
-        /**
-         * @brief 数据写出：将加密结果从本地Tensor复制回GM
-         *
-         * 流水线Stage 3：本函数对应“CopyOut”阶段，从 outQueueCipher 中取出已经完成加密的本地Tensor，
-         * 并使用 DataCopy() 写回至 GM 中的目标地址，最后释放本地Tensor。
-         *
-         * - DeQue() 从 outQueueCipher 获取已加密的本地Tensor。
-         * - DataCopy() 将加密结果写回到 GM（ciphertextGm）。
-         * - FreeTensor() 释放本地Tensor 以复用空间。
-         *
-         * 至此，一个完整的 Pipeline（CopyIn -> Compute -> CopyOut）操作完成。
-         */
+
         __aicore__ inline void CopyOut(int idx)
         {
+            int32_t tileLen = GetTileLen(idx);
             AscendC::LocalTensor<half> cipherLocal = outQueueCipher.DeQue<half>();
-            AscendC::DataCopy(ciphertextGm[idx * TILE_LENGTH], cipherLocal, TILE_LENGTH);
+            AscendC::DataCopy(ciphertextGm[idx * TILE_LENGTH], cipherLocal, tileLen);
             outQueueCipher.FreeTensor(cipherLocal);
         }
-    
+
     private:
-        AscendC::TPipe pipe;  ///< 负责管理Pipeline的调度与多缓冲机制
-    
-        /// 输入队列：存放明文的本地Tensor（VECIN 位置）
+        AscendC::TPipe pipe;
         AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueuePlain;
-        /// 输出队列：存放加密后密文的本地Tensor（VECOUT 位置）
         AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueCipher;
-    
-        /// GM中存储明文的区域
         AscendC::GlobalTensor<half> plaintextGm;
-        /// GM中存储密文的区域
         AscendC::GlobalTensor<half> ciphertextGm;
-    
-        /// 存储GM传入的iv和key及扩展后的密钥
         uint8_t IV[AES_BLOCK_BYTES];
         uint8_t expandedKey[AES_EXPANDED_KEY_BYTES];
-    
-        /// AES S-box数组，用于SubBytes等操作
         uint8_t sbox[256];
-
-        // int32_t TOTAL_LENGTH;  // 总数量
-        // int32_t USE_CORE_NUM;         // 使用的核心数
-        // int32_t BLOCK_LENGTH;
-        // int32_t TILE_NUM;             // tile数量 8
-        // int32_t TILE_LENGTH; // pipeline切分长度128
-        // uint32_t totalLength;
-        // uint32_t tileNum;
-        // uint32_t blockLength;
-        // uint32_t tileLength;
+        int32_t thisBlockLen_;
+        int32_t loopCount_;
     };
-    
 
- 
+
 extern "C" __global__ __aicore__ void aes_ctr_decrypt(GM_ADDR cyphertext, GM_ADDR key, GM_ADDR plaintext, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
 

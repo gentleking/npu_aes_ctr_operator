@@ -23,17 +23,18 @@ int deviceId = 0;
 
 OperatorDesc CreateOpDesc()
 {
-    // define operator
-    // std::vector<int64_t> shape{8, 2048};
-    std::vector<int64_t> plaintext_shape{8, 2048};
+    size_t fileSize = GetFileSize("../input/plaintext.bin");
+    int64_t numElements = static_cast<int64_t>(fileSize);
+    std::vector<int64_t> plaintext_shape{numElements};
     std::vector<int64_t> key_shape{1, 16};
-    std::vector<int64_t> cyphertext_shape{8, 2048};
+    std::vector<int64_t> cyphertext_shape{numElements};
     aclDataType dataType = ACL_UINT8;
     aclFormat format = ACL_FORMAT_ND;
     OperatorDesc opDesc;
     opDesc.AddInputTensorDesc(dataType, plaintext_shape.size(), plaintext_shape.data(), format);
     opDesc.AddInputTensorDesc(dataType, key_shape.size(), key_shape.data(), format);
     opDesc.AddOutputTensorDesc(dataType, cyphertext_shape.size(), cyphertext_shape.data(), format);
+    INFO_LOG("OpDesc created: input size = %ld bytes", numElements);
     return opDesc;
 }
 
@@ -155,12 +156,12 @@ int main(int argc, char **argv)
     }
     INFO_LOG("Init resource success");
 
-    if (!RunOp()) {
-        DestroyResource();
-        return FAILED;
-    }
+    bool opResult = RunOp();
+    INFO_LOG("RunOp result: %s", opResult ? "SUCCESS" : "FAILED");
 
+    INFO_LOG("Starting resource cleanup...");
     DestroyResource();
+    INFO_LOG("Cleanup complete");
 
-    return SUCCESS;
+    return opResult ? SUCCESS : FAILED;
 }

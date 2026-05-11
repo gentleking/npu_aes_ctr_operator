@@ -17,6 +17,18 @@
 
 extern bool g_isDevice;
 
+size_t GetFileSize(const std::string &filePath)
+{
+    struct stat sBuf;
+    if (stat(filePath.data(), &sBuf) == -1) {
+        return 0;
+    }
+    if (S_ISREG(sBuf.st_mode) == 0) {
+        return 0;
+    }
+    return static_cast<size_t>(sBuf.st_size);
+}
+
 bool ReadFile(const std::string &filePath, size_t fileSize, void *buffer, size_t bufferSize)
 {
     struct stat sBuf;
@@ -51,7 +63,6 @@ bool ReadFile(const std::string &filePath, size_t fileSize, void *buffer, size_t
     }
     buf->pubseekpos(0, std::ios::in);
     buf->sgetn(static_cast<char *>(buffer), size);
-    fileSize = size;
     file.close();
     return true;
 }

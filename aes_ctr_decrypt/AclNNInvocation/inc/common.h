@@ -32,6 +32,7 @@
  * @return read result
  */
 bool ReadFile(const std::string &filePath, size_t fileSize, void *buffer, size_t bufferSize);
+size_t GetFileSize(const std::string &filePath);
 
 /**
  * @brief Write data to file
