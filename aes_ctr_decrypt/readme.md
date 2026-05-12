@@ -38,8 +38,7 @@ aes_ctr_decrypt/
 │   ├── run_op_plugin.sh             # 一键编译部署运行脚本
 │   └── run_v1.sh
 ├── benchmark_all.py                  # 统一性能测试脚本（1KB ~ 2GB，覆盖ACLNN和PyTorch两种调用方式）
-├── PERF_ANALYSIS.md                 # 大尺寸性能分析报告
-├── REPRODUCTION_GUIDE.md            # 修改内容复现指南
+├── PERF_ANALYSIS.md                 # 性能分析报告 + 复现指南
 └── readme.md
 ```
 
