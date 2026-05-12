@@ -506,11 +506,11 @@ NPU 的 AI Core 主要面向矩阵/向量运算（如卷积、Transformer），A
 2. AES 10 轮标量计算的 CPI
 3. GM ↔ Local 数据搬运带宽
 
-## 5.1 优化方向分析
+### 5.1 优化方向分析
 
 当前吞吐约 77 MB/s，以下是理论上可考虑的优化方向及其可行性：
 
-### 方向 1：消除 half ↔ uint8 转换（收益高，但受硬件约束）
+#### 方向 1：消除 half ↔ uint8 转换（收益高，但受硬件约束）
 
 当前每个 tile 都要做 half→uint8 解包和 uint8→half 打包，这是纯软件开销。如果 `LocalTensor<uint8_t>` 能被 `DataCopy` 硬件直接支持，可以省掉这笔开销：
 
@@ -524,7 +524,7 @@ AesCtrEncrypt(plainLocal.GetValue(0), ...);
 
 实际上，当前 Ascend C 的 DataCopy 硬件对 half 支持最好，`uint8_t` 的 LocalTensor 可能被内部提升为 half，或需要手动 `AscendC::ConvertTo`。如果能用原生 uint8 传输，预计可提升 **20-30%**。
 
-### 方向 2：增大 TILE_LENGTH（收益中等）
+#### 方向 2：增大 TILE_LENGTH（收益中等）
 
 当前 TILE_LENGTH = 64 halfs（128 字节 / tile），每核的 pipeline 迭代次数较多。增大 TILE_LENGTH 可减少迭代次数，降低 pipeline stage 切换开销：
 
@@ -535,7 +535,7 @@ TILE_LENGTH=256: loopCount = N/256 次迭代（减少 75% 迭代次数）
 
 **风险**：TILE_LENGTH 增大会占用更多 Local Memory。当前每核 LM 占用为 `TILE_LENGTH × sizeof(half) × BUFFER_NUM × 2 个队列 = 64 × 2 × 2 × 2 = 512 字节`。如果 TILE_LENGTH=256，占用 2048 字节，仍在 LM 预算内（通常几十 KB），可以尝试。
 
-### 方向 3：增加 BUFFER_NUM（收益低）
+#### 方向 3：增加 BUFFER_NUM（收益低）
 
 当前 BUFFER_NUM=2 实现乒乓缓冲。增加到 3 或 4 可以更深度隐藏 DataCopy 延迟：
 
@@ -545,53 +545,97 @@ constexpr int32_t BUFFER_NUM = 3;  // 三缓冲
 
 **代价**：多占 50% 的 Local Memory（每增加 1 个 buffer = TILE_LENGTH × sizeof(half) = 128 字节）。在 LM 充足时值得尝试，但预期收益不高（DataCopy 延迟已经可以被 2 缓冲较好地隐藏）。
 
-### 方向 4：增大 TILE_LENGTH（收益中等，推荐首选）
+#### 方向 4：用 Vector 指令加速 AES 步骤（收益潜力大，改造复杂）
 
-当前 TILE_LENGTH = 64 halfs（128 字节 / tile），每核的 pipeline 迭代次数较多。增大 TILE_LENGTH 可减少迭代次数，降低 pipeline stage 切换开销：
+当前 AES 所有步骤（SubBytes、ShiftRows、MixColumns、AddRoundKey）都是用**纯标量 C 代码**逐字节执行的，AI Core 的 Vector 单元和 Cube 单元完全没有被利用。
+
+##### AES 各步骤的可向量化分析
+
+AI Core 的 Vector 单元一次可处理 128 字节（256 位或 128 字节取决于具体指令），Cube 单元专攻矩阵乘法。AES 的核心操作是否可以映射到这些硬件单元？
+
+| AES 步骤 | 操作类型 | 可向量化？ | 分析 |
+|---------|---------|-----------|------|
+| **AddRoundKey** | 16 字节 XOR | **✅ 很容易** | XOR 是 Vector 原生指令（`VecXor`），可直接做 128 位 XOR，16 字节一个块，8 个块同时做也只需一次 128 字节 VecXor |
+| **CTR 异或** | 密文 XOR 密钥流 | **✅ 很容易** | 同上，VecXor 一次处理 |
+| **MixColumns** | 4 列独立 GF 运算 | **✅ 可行** | 每列 4 字节，操作相同（xtime + XOR），可拆为向量化的 byte-wise 运算。8 块并行时一次处理 32 列 |
+| **ShiftRows** | 16 字节内置换 | **⚠️ 有条件** | 块内固定置换，如果 Vector 有 `VecPermute` 可一次完成；否则需要分别处理各行 |
+| **SubBytes** | 256 元 S-box 查表 | **❌ 困难** | 这是最核心的瓶颈。S-box 是非线性字节替换，每个字节查同一张 256 元素表。Vector 单元没有 gather/scatter 式的查表指令。如果要向量化，只能用数学公式逼近 S-box（GF(2^8) 求逆 + 仿射变换），但这涉及大量 GF 运算，得不偿失 |
+| **KeyExpansion** | 串行依赖 | **❌ 不可行** | 每轮子密钥依赖前一轮，数据流高度串行 |
+
+##### 最可行的方案：多块并行 + 部分向量化
+
+既然单块 AES 只有 16 字节，Vector 单元一次处理 128 字节，可以**一次处理 8 个 AES 块**，充分利用 Vector 宽度：
 
 ```
-TILE_LENGTH=64:  loopCount = N/64 次迭代（以每核处理 8KB 数据为例 = 128 次）
-TILE_LENGTH=256: loopCount = N/256 次迭代（= 32 次，减少 75%）
+┌─ AES 块0 ─┬─ AES 块1 ─┬─ ... ─┬─ AES 块7 ─┐
+│ 16 字节   │ 16 字节    │       │ 16 字节     │  = 128 字节
+└───────────┴───────────┴───────┴─────────────┘
+                 全部一起 VecXor（AddRoundKey）
+                 全部一起 VecXor（CTR XOR）
+                 全部一起向量化 MixColumns
+                 SubBytes 保持逐字节（串行或伪向量化）
 ```
 
-**风险**：TILE_LENGTH 增大会占用更多 Local Memory。当前每核 LM 占用为 `TILE_LENGTH × sizeof(half) × BUFFER_NUM × 2 个队列 = 64 × 2 × 2 × 2 = 512 字节`。如果 TILE_LENGTH=256，占用 2048 字节，仍在 LM 预算内（通常几十 KB），值得尝试。需同步增大 `plainBuf` / `cipherBuf` 的栈数组大小。
-
-### 方向 5：消除 half ↔ uint8 转换（收益高，但受硬件约束）
-
-当前每个 tile 都要做 half→uint8 解包和 uint8→half 打包，这是纯软件开销。如果能直接在 uint8 空间操作，可以省掉这笔开销。
-
-当前，Ascend C 的 `DataCopy` 和 `LocalTensor` 对 half 支持最好。以下思路可探索：
+**核心改造思路**：
 
 ```cpp
-// 尝试直接使用 uint8 LocalTensor（需验证 DataCopy 是否支持）
-AscendC::LocalTensor<uint8_t> plainLocal = inQueuePlain.AllocTensor<uint8_t>();
-AscendC::DataCopy(plainLocal, plaintextGm, tileLen * 2);  // 按字节数搬运
+// 当前：逐块串行（8个块 × 10轮）
+for (每个 16B AES 块) {
+    for (10 轮) {
+        SubBytes(state)      // 标量查表 × 16 字节
+        ShiftRows(state)     // 标量置换
+        MixColumns(state)    // 标量 GF 运算
+        AddRoundKey(state)   // 标量 XOR
+    }
+}
+
+// 改造后：8 块并行 + Vector 加速
+// 将 8 个 block 的 state 按"平面"组织 (8×16=128 字节)
+// SubBytes: 按块分别标量执行（暂无法向量化）
+for (int b = 0; b < 8; b++) {
+    for (int i = 0; i < 16; i++) {
+        states_8x16[b][i] = sbox[states_8x16[b][i]];
+    }
+}
+// ShiftRows: 可向量化（固定偏移）
+VecPermute(states_8x16, shift_mask_8x16);  // 128 字节一次置换
+// MixColumns: 可向量化（4 列独立）
+VecXor/VecShl(states_8x16, mix_mask);     // 向量化 GF 运算
+// AddRoundKey: 可向量化
+VecXor(states_8x16, roundKey_8blocks);    // 128 字节一次 XOR
+// CTR XOR: 可向量化
+VecXor(plaintext_8blocks, states_8x16);   // 128 字节一次 XOR
 ```
 
-如果 DataCopy 支持 uint8 类型搬运，可以省掉两个转换循环，预期提升 **20-30%**。如果硬件不支持，可能需要用 `AscendC::ConvertTo` 或保序重解释方法。
+##### Cube 单元？不现实
 
-### 方向 6：增加 BUFFER_NUM（收益低）
+Cube 单元是**矩阵乘法累加器**（`C = A × B + C`），AES 的 AddRoundKey（XOR）、SubBytes（查表）、ShiftRows（置换）、MixColumns（GF 运算）都无法有效映射到矩阵乘法上。即使勉强将 MixColumns 表达为矩阵乘，也需要额外的格式转换开销，远不如直接用 Vector XOR 高效。**Cube 不适用于此场景。**
 
-当前 BUFFER_NUM=2 实现乒乓缓冲。增加到 3 或 4 可以更深度隐藏 DataCopy 延迟：
+##### 可行性总结
 
-```cpp
-constexpr int32_t BUFFER_NUM = 3;  // 三缓冲
-```
+| 加速手段 | AES 步骤 | 可行度 | 说明 |
+|---------|---------|-------|------|
+| Vector XOR | AddRoundKey、CTR XOR | **直接可用** | 当前可立即修改，把标量 XOR 替换为 VecXor |
+| Vector permute | ShiftRows | **需要验证** | 需确认 `VecPermute` 是否支持字节级置换 |
+| Vector GF | MixColumns | **需要验证** | 需构造向量化的 xtime + XOR 序列 |
+| 标量查表 | SubBytes | **暂时保持标量** | 无法向量化，最多 8 块并行做 8 组独立查表 |
+| 8 块并行 | 全部步骤 | **架构级改造** | 块间无数据依赖，天然可并行，是收益最大化的基础 |
 
-**代价**：多占 50% 的 Local Memory（每增加 1 个 buffer = TILE_LENGTH × sizeof(half) = 128 字节）。在 LM 充足时值得尝试，但预期收益不高（DataCopy 延迟已经可以被 2 缓冲较好地隐藏）。
+**预计收益**：如果 SubBytes 外的所有步骤都向量化 + 8 块并行，单次 Vector 指令处理 128 字节，相对当前逐标量处理 128 字节约有 **2-4 倍**的理论加速。但 SubBytes 仍然是拖后腿的瓶颈（256 元素表查表无法向量化），可能使最终加速比缩小到 **1.5-2 倍**。这需要深入的 Ascend C Vector API 验证和实际 profiling。
 
-### 方向 7：S-box 放到常量存储（低收益，省 LM 空间）
+#### 方向 5：S-box 放到常量存储（低收益，省 LM 空间）
 
 当前 S-box 存在 LM 中占 256 字节，可以移到 `__constant__` 只读存储，释放的 LM 空间可用于增大 TILE_LENGTH。但 S-box 查表在 LM 中是最快的（1-2 周期），放到常量存储会增加查表延迟，**仅当 LM 空间不足需要增大 TILE_LENGTH 时才值得做**。
 
-### 方向 8：AES 循环展开（收益低）
+#### 方向 6：AES 循环展开（收益低）
 
 AES 10 轮展开成直线代码，减少循环控制开销。AES 每轮计算本身就是计算密集的（SubBytes 查表 + ShiftRows + MixColumns），循环控制开销占比极小，**收益可忽略**。
 
-### 优化方向汇总
+#### 优化方向汇总
 
 | 优化方向 | 预估收益 | 实现难度 | 风险 |
 |---------|---------|---------|------|
+| **Vector 加速 AES 步骤** | **+50~200%** | **高** | 需深入 Ascend C Vector API |
 | **增大 TILE_LENGTH** | **+5~15%** | **低** | LM 溢出 |
 | 消除 half 转换 | +20~30% | 高（取决于硬件支持） | 可能不支持 |
 | 增加 BUFFER_NUM | +0~5% | 低 | LM 占用增加 |
@@ -606,7 +650,7 @@ AES 10 轮展开成直线代码，减少循环控制开销。AES 每轮计算本
 - **CopyIn/CopyOut 阶段**：DataCopy 带宽通常为几十 GB/s，128 字节的传输约需几十个周期，不是瓶颈。
 - **half 转换**：两个 for 循环各遍历所有字节，是纯软件开销。
 
-**综合建议**：增大 TILE_LENGTH 是最简单的优化手段，改一个数字即可尝试。消除 half 转换需要深入验证硬件支持程度，如果可行则是收益最高的方向。
+**综合建议**：Vector 加速 AES 步骤是理论上收益最高的方向，但改造成本大、需验证 VecPermute 等 API 是否支持字节级操作。增大 TILE_LENGTH 和消除 half 转换是更务实的入手点，改造成本低，收益确定。
 
 ---
 
