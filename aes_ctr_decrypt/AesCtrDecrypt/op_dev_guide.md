@@ -255,6 +255,54 @@ for (int i = 0; i < tileLen; i++) {
 }
 ```
 
+### 3.1.1 LM vs GM：各变量的存储位置
+
+理解每个变量存储在 LM 还是 GM，是 NPU 开发的关键。下面完整列出本算子中所有变量的归属：
+
+```
+LM（每个核独享，几十 KB，低延迟）
+──────────────────────────────────────────────────────────────────
+类别           变量                          说明
+──────────     ─────────────────────────     ─────────────────────
+成员数组       sbox[256]                    AES S-box 查表
+               expandedKey[176]             扩展密钥
+               IV[16]                       计数器
+
+成员标量       thisBlockLen_, loopCount_    分块状态
+
+流水线         pipe                         流水线管理器
+               inQueuePlain, outQueueCipher  队列描述符
+               plaintextGm, ciphertextGm     GlobalTensor 描述符
+                                            （描述符在 LM，数据在 GM）
+
+计算 buffer    plainBuf, cipherBuf           AES 工作缓冲区
+               plainLocal, cipherLocal       DataCopy 缓冲区
+
+函数栈         localKey, TmpIv, blockDim,
+               blockIdx, startOffset 等      临时变量
+```
+
+```
+GM（所有核共享，几十 GB，高延迟）
+──────────────────────────────────────────────────────────────────
+类别           变量                          说明
+──────────     ─────────────────────────     ─────────────────────
+kernel 参数    cyphertext, key, plaintext    GM_ADDR 指向的原始数据
+               tiling                        Host 传来的 tiling buffer
+
+tiling 数据    tiling_data.totalLength       GET_TILING_DATA 解析出
+               tiling_data.tileNum
+
+数据区         plaintextGm[i] 引用的元素     输入密文（GM 中的 uint8/half）
+               ciphertextGm[i] 引用的元素    输出明文（GM 中的 uint8/half）
+```
+
+**关键判断原则**：
+- `DataCopy(src, dst, n)` — src/dst 一个在 GM、一个在 LM 之间搬运
+- `pipe.InitBuffer(...)` 分配出来的 `LocalTensor` — 在 LM
+- `__gm__` 修饰的指针或 `GM_ADDR` 类型参数 — 指向 GM
+- 未被 `__gm__` 修饰的局部变量和成员变量 — 在 LM（NPU kernel 的栈帧位于 LM）
+
 ### 3.2 TQue 三阶段流水线
 
 NPU 上数据搬运（GM ↔ Local）需要几百个周期，如果串行执行（搬完再算，算完再搬），性能会非常差。TQue 流水线让数据搬运和计算重叠进行。
