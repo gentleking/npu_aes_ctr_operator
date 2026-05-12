@@ -549,6 +549,8 @@ constexpr int32_t BUFFER_NUM = 3;  // 三缓冲
 
 当前 AES 所有步骤（SubBytes、ShiftRows、MixColumns、AddRoundKey）都是用**纯标量 C 代码**逐字节执行的，AI Core 的 Vector 单元和 Cube 单元完全没有被利用。
 
+**实践经验**：在 CANN 8.0.0 版本中，Ascend C 的 Vector API 未提供 `VecXor` 指令。二进制运算仅支持 `Add`、`Sub`、`Mul`、`Div`，不支持按位 XOR。因此**当前版本无法直接通过 VecXor 加速 AES 中的 XOR 操作**。需要后续 CANN 版本或通过其他方式（如 `PIPE_V` 编程模型的底层指令）实现。
+
 ##### AES 各步骤的可向量化分析
 
 AI Core 的 Vector 单元一次可处理 128 字节（256 位或 128 字节取决于具体指令），Cube 单元专攻矩阵乘法。AES 的核心操作是否可以映射到这些硬件单元？
@@ -635,8 +637,8 @@ AES 10 轮展开成直线代码，减少循环控制开销。AES 每轮计算本
 
 | 优化方向 | 预估收益 | 实现难度 | 风险 |
 |---------|---------|---------|------|
-| **Vector 加速 AES 步骤** | **+50~200%** | **高** | 需深入 Ascend C Vector API |
 | **增大 TILE_LENGTH** | **+5~15%** | **低** | LM 溢出 |
+| **Vector 加速 AES 步骤** | **待验证** | **当前不支持** | CANN 8.0.0 无 VecXor API |
 | 消除 half 转换 | +20~30% | 高（取决于硬件支持） | 可能不支持 |
 | 增加 BUFFER_NUM | +0~5% | 低 | LM 占用增加 |
 | S-box 常量存储 | 换 LM 空间 | 低 | 查表变慢 |
