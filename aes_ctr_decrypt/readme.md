@@ -207,51 +207,153 @@ target_link_libraries(execute_add_op ascendcl cust_opapi acl_op_compiler nnopbas
 
 ### 适配原理
 
-PyTorch通过PTA（PyTorch Adapter）框架调用自定义算子，适配分为两步：
+PyTorch 本身不知道 `npu_aes_ctr_decrypt` 这个算子。要让 `torch_npu.npu_aes_ctr_decrypt()` 可用，需要通过 **PTA（PyTorch Adapter）** 框架将自定义算子注册到 PyTorch 的算子体系中。
 
-1. **YAML配置**：在`op_plugin_functions.yaml`中声明算子接口
-2. **Kernel适配**：编写`AesCtrDecryptKernelNpuApi.cpp`，使用`EXEC_NPU_CMD`宏调用ACLNN算子
+调用链路如下：
 
-### 算子接口
+```
+Python: torch_npu.npu_aes_ctr_decrypt(cyphertext, key)
+          │
+          ▼
+  YAML 声明 → PTA 自动生成 Python binding
+(op_plugin_functions.yaml)
+          │
+          ▼
+  C++ Adapter: AesCtrDecryptKernelNpuApi.cpp
+  (EXEC_NPU_CMD → aclnnAesCtrDecrypt)
+          │
+          ▼
+  ACLNN API: libcust_opapi.so (已通过算子安装包部署)
+          │
+          ▼
+  NPU Kernel: aes_ctr_decrypt (Ascend C 二进制)
+```
 
-**YAML定义** (`op_plugin_patch/op_plugin_functions.yaml`):
+适配分为**两步**：
+
+#### 第 1 步：YAML 声明算子接口
+
+在 `op_plugin_functions.yaml` 中声明算子的 Python 层签名和对应的 NPU 后端：
+
 ```yaml
   - func: npu_aes_ctr_decrypt(Tensor cyphertext, Tensor key) -> Tensor
     op_api: all_version
 ```
 
-**C++适配** (`op_plugin_patch/AesCtrDecryptKernelNpuApi.cpp`):
+PTA 的代码生成器会解析这个 YAML，自动生成：
+- Python binding 代码（使 `torch_npu.npu_aes_ctr_decrypt` 可供调用）
+- 派发到 NPU 后端的桩函数声明
+
+`all_version` 表示该算子对所有 PyTorch 版本生效，无需每个版本单独配置。
+
+#### 第 2 步：C++ Adapter 实现真正的 NPU 调用
+
+`AesCtrDecryptKernelNpuApi.cpp` 实现了桩函数，核心就三件事：
+
 ```cpp
 at::Tensor npu_aes_ctr_decrypt(const at::Tensor &cyphertext, const at::Tensor &key)
 {
+    // 1. 分配输出 Tensor（形状与输入相同）
     at::Tensor plaintext = npu_preparation::apply_tensor_without_format(cyphertext);
+    // 2. 调用 ACLNN API 执行 NPU 算子
     EXEC_NPU_CMD(aclnnAesCtrDecrypt, cyphertext, key, plaintext);
+    // 3. 返回结果
     return plaintext;
 }
 ```
 
-### Python调用
+`EXEC_NPU_CMD` 宏展开后等价于手动调用 `aclnnAesCtrDecryptGetWorkspaceSize` + `aclnnAesCtrDecrypt`，由 PTA 封装了 workspace 分配和 stream 同步的细节。
 
-```python
-import torch_npu
-decrypttext = torch_npu.npu_aes_ctr_decrypt(ciphertext.npu(), key.npu())
+### 工程文件位置
+
+```
+op_plugin_patch/
+├── op_plugin_functions.yaml        # YAML 算子声明
+└── AesCtrDecryptKernelNpuApi.cpp   # C++ Adapter 实现
 ```
 
-支持eager模式和`torch.compile`图模式。
+这两个文件需要在 PTA 源码编译前合并到 PTA 仓库的对应位置。
 
 ### 部署与运行
 
-一键部署（首次运行）：
+#### 首次部署（一次性的 PTA 编译）
+
+`run_op_plugin.sh` 实现了完整的首次部署流程：
+
 ```bash
 bash run_op_plugin.sh
 ```
-该脚本会：克隆PTA源码 → 注册自定义算子 → 编译安装torch_npu → 运行测试。
 
-后续测试可直接：
+该脚本内部执行：
+
+1. **克隆 PTA 源码** — 从 gitee 拉取对应 PyTorch 版本的 Ascend PyTorch Adapter
+2. **合并补丁** — 将 `op_plugin_functions.yaml` 追加到 PTA 的算子声明列表，将 `AesCtrDecryptKernelNpuApi.cpp` 复制到 PTA 的 kernel 目录
+3. **编译安装 torch_npu** — 使用补丁后的源码编译 `torch_npu`，生成新的 `.so`
+4. **运行测试** — 调用 `test_ops_custom.py` 验证算子正确性
+
+部署完成后，`torch_npu` 就永久包含了 `npu_aes_ctr_decrypt` 算子，后续无需重复执行此步骤（除非 PyTorch 版本升级需要重新编译）。
+
+#### 后续日常使用
+
+PTA 部署只需做一次，之后可以直接使用：
+
 ```bash
-python3 test_ops_custom.py               # eager模式
-python3 test_ops_custom_benchmark.py      # 性能profiling
+python3 test_ops_custom.py               # eager 模式测试
+python3 test_ops_custom_benchmark.py      # 性能 profiling
 ```
+
+### Python 调用方式
+
+```python
+import torch
+import torch_npu
+
+# 数据搬到 NPU，调用自定义算子
+cyphertext = cyphertext.npu()   # uint8 tensor, 任意形状
+key = key.npu()                 # uint8 tensor, shape [1, 16]
+plaintext = torch_npu.npu_aes_ctr_decrypt(cyphertext, key)
+result = plaintext.cpu()        # 结果拷回 CPU
+```
+
+支持 eager 模式（立即执行）和 `torch.compile` 图模式。
+
+### 在整个调用链中的位置
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     算子完整调用链路                              │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Python: torch_npu.npu_aes_ctr_decrypt()                        │
+│      │                                                          │
+│      ▼                                                          │
+│  PTA 适配层 (YAML + C++ Adapter)  ←── 一次性编译注入              │
+│      │                                                          │
+│      ▼                                                          │
+│  ACLNN API (libcust_opapi.so)        ←── LD_LIBRARY_PATH         │
+│      │                                                          │
+│      ▼                                                          │
+│  CANN Runtime                                                    │
+│      │                                                          │
+│      ▼                                                          │
+│  NPU Kernel (Ascend C 二进制)        ←── custom_opp_*.run 安装    │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+每一层的依赖：
+| 层 | 部署方式 | 是否需要重复执行 |
+|---|---------|----------------|
+| NPU Kernel | `custom_opp_*.run` 安装 | 算子更新时需要 |
+| ACLNN API | 随 kernel 安装包部署 | 同上 |
+| PTA 适配 | `run_op_plugin.sh` 编译 torch_npu | **仅首次** |
+| LD_LIBRARY_PATH | export 环境变量 | 每次新终端需要 |
+
+### 注意事项
+
+- PTA 适配是**一次性的**，算子和 PyTorch 版本需匹配。如果升级 PyTorch 或 CANN，需要重新执行 `run_op_plugin.sh`
+- 算子安装包更新后（`custom_opp_*.run`），PTA 层**无需重新编译**，只需确保 `LD_LIBRARY_PATH` 指向新的 API 库路径
+- 如果 `torch_npu.npu_aes_ctr_decrypt()` 报 `undefined symbol` 或 `not implemented` 错误，说明 PTA 适配未完成或与当前算子版本不匹配
 
 ## 性能分析
 
