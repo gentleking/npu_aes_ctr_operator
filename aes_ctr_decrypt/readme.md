@@ -37,9 +37,7 @@ aes_ctr_decrypt/
 │   ├── benchmark_aes_ctr_encrypt.py # PyTorch基准测试+profiling
 │   ├── run_op_plugin.sh             # 一键编译部署运行脚本
 │   └── run_v1.sh
-├── benchmark_aes_ctr.py             # ACLNN多数据量性能测试脚本
-├── benchmark_fixed.py               # ACLNN固定数据量性能测试脚本
-├── benchmark_large_sizes.py         # PyTorch大尺寸（1M~2G）性能测试脚本
+├── benchmark_all.py                  # 统一性能测试脚本（1KB ~ 2GB，覆盖ACLNN和PyTorch两种调用方式）
 ├── PERF_ANALYSIS.md                 # 大尺寸性能分析报告
 ├── REPRODUCTION_GUIDE.md            # 修改内容复现指南
 └── readme.md
@@ -271,38 +269,16 @@ python3 test_ops_custom_benchmark.py      # 性能profiling
 
 ### 基准测试脚本
 
-**ACLNN模式多数据量测试** (`benchmark_aes_ctr.py`)：
+**统一性能测试脚本** (`benchmark_all.py`)：
 
-功能：覆盖多种数据规模（1KB、4KB、16KB、64KB、256KB、1MB、4MB、16MB），自动生成测试数据并调用ACLNN可执行文件，每轮各跑5次（取后4次平均，首次作为warmup跳过），使用PyCryptodome进行结果验证，输出每个数据量的平均耗时和吞吐量。
-
-数据生成方式：使用固定KEY和IV，通过标准库`Crypto.Cipher.AES`生成密文和golden数据。
+覆盖 1KB ~ 2GB 共 17 个数据量级，自动检测可用的调用方式（优先 PyTorch，备选 ACLNN），每轮 warmup 3 次后测量 5 次取统计值，使用 PyCryptodome 验证正确性：
 
 ```bash
-python3 benchmark_aes_ctr.py
-```
+# PyTorch方式（需torch_npu环境）
+/root/miniconda3/envs/operator-dev/bin/python3 benchmark_all.py
 
-**ACLNN模式固定数据量测试** (`benchmark_fixed.py`)：
-
-功能：固定16KB数据量，使用`time.perf_counter()`高精度计时，跑10次取平均耗时并计算吞吐量，流程包含warmup和结果验证。适用于快速验证算子性能和功能正确性。
-
-**PyTorch模式测试** (`benchmark_aes_ctr_encrypt.py` 和 `test_ops_custom_benchmark.py`)：
-
-使用`torch_npu.profiler`进行算子级性能分析，导出Chrome Trace格式的profiling数据：
-
-```python
-prof = torch_npu.profiler.profile(experimental_config=experimental_config_, with_stack=True)
-prof.start()
-test()
-prof.stop()
-prof.export_chrome_trace('./trace/chrome_trace_*.json')
-```
-
-**大尺寸性能测试** (`benchmark_large_sizes.py`)：
-
-覆盖 1MB ~ 2GB 的大数据量范围，使用 PyTorch 调用 `torch_npu.npu_aes_ctr_decrypt()`，每次 warmup 3 轮后测量 5 轮取统计值，通过 PyCryptodome 验证正确性：
-
-```bash
-/root/miniconda3/envs/operator-dev/bin/python3 benchmark_large_sizes.py
+# 或使用系统默认python（备选ACLNN方式）
+python3 benchmark_all.py
 ```
 
 ### 性能profiling
