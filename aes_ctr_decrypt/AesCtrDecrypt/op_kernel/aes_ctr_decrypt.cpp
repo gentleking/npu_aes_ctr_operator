@@ -5,19 +5,19 @@
  * ============ NPU 算子开发的核心概念 ============
  *
  * 1. 两级存储架构
- *    - GM (Global Memory): 大容量（GB 级），高延迟，所有核共享
+ *    - GM (Global Memory): 大容量，高延迟，所有核共享
  *      类似 CPU 的 RAM，但位于 NPU 芯片外部（HBM）
- *    - Local Memory: 小容量（几十 KB/核），低延迟，每个核独享
+ *    - Local Memory: 小容量（几十KB/核），低延迟，每个核独享
  *      kernel 必须将数据从 GM 搬到 Local Memory 后才能计算
- *      本算子的 TILE_LENGTH=64 halfs(=128 字节) 就是 Local Memory 的 tile 大小
+ *      本算子的 TILE_LENGTH=1024 halfs(2048 字节) 即为 Local Memory 的 tile 大小
  *
- * 2. TQue 流水线（三阶段乒乓缓冲）
- *    为了隐藏 GM→Local 的数据搬运延迟，采用 CopyIn → Compute → CopyOut
+ * 2. TQue 流水线（三阶段，双缓冲区）
+ *    为了隐藏 GM → Local 的数据搬运延迟，采用 CopyIn → Compute → CopyOut
  *    三阶段流水线并行：
  *      CopyIn（搬入）:    GM → Local（DataCopy 指令）
  *      Compute（计算）:   Local 中执行 AES-CTR 解密
  *      CopyOut（搬出）:   Local → GM（DataCopy 指令）
- *    缓冲数量 BUFFER_NUM=2 实现乒乓缓冲：一块 buffer 在计算时，
+ *    缓冲数量 BUFFER_NUM=2 实现双缓冲：一块 buffer 在计算时，
  *    另一块 buffer 在搬运数据，两者并行。
  *
  * 3. half 类型 reinterpretation
@@ -44,10 +44,10 @@
 #include <cstring>
 
 // ==================== 编译期常量 ====================
-constexpr int32_t BUFFER_NUM = 2;       // 双缓冲数量（乒乓缓冲深度）
-constexpr int32_t TILE_LENGTH = 64;      // 每个 tile 的 half 数量
+constexpr int32_t BUFFER_NUM = 2;       // 双缓冲
+constexpr int32_t TILE_LENGTH = 1024;    // 每个 tile 的 half 数量（优化：从64增至1024）
                                          // 用于分配 Local Memory buffer
-                                         // 对应 64 * 2 = 128 字节/ tile
+                                         // 对应 1024 * 2 = 2048 字节/ tile
 
 // ==================== AES 参数定义 ====================
 static const int AES_KEY_BYTES = 16;              // AES-128 密钥字节数
@@ -57,9 +57,9 @@ static const int AES_EXPANDED_KEY_BYTES = 16 * (AES_ROUND_NUM + 1);  // 扩展�
 
 
 // ==================== AES 算法核心函数 ====================
-// 以下函数均被 __aicore__ 修饰，表示在 NPU AI Core 上执行。
-// 它们在 KernelAesCtrDecrypt::Compute() 中被调用，
-// 操作的是已经搬到 Local Memory 中的数据缓冲区（plainBuf / cipherBuf）。
+// 函数被 __aicore__ 修饰，表示在 NPU AI Core 上执行
+// 这些函数在 KernelAesCtrDecrypt::Compute() 中被调用，
+// 操作 Local Memory 中的数据缓冲区（plainBuf / cipherBuf）
 
 /**
  * @brief GF(2^8) 中左移操作
@@ -377,10 +377,9 @@ public:
      *
      * 本函数执行以下操作：
      *
-     * 1. 动态分块（修复 16KB 硬编码限制的关键）
-     *    原始版本硬编码 TOTAL_LENGTH=8192 halfs，本版本改为根据 tiling
-     *    传入的 totalLength 动态计算。totalLength 是 uint8 元素数（=字节数），
-     *    除以 2 得 half 单元数，再按核数均分。
+     * 1. 动态分块
+     *    根据 tiling 传入的 totalLength 动态计算。totalLength 是 
+     *    uint8 元素数（=字节数），除以 2 得 half 单元数，再按核数均分。
      *
      * 2. 设置 GlobalTensor 的 GM 地址和长度
      *    每个核通过 startOffset 定位到自己要处理的那段 GM 数据
