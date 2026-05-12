@@ -39,6 +39,9 @@ aes_ctr_decrypt/
 │   └── run_v1.sh
 ├── benchmark_aes_ctr.py             # ACLNN多数据量性能测试脚本
 ├── benchmark_fixed.py               # ACLNN固定数据量性能测试脚本
+├── benchmark_large_sizes.py         # PyTorch大尺寸（1M~2G）性能测试脚本
+├── PERF_ANALYSIS.md                 # 大尺寸性能分析报告
+├── REPRODUCTION_GUIDE.md            # 修改内容复现指南
 └── readme.md
 ```
 
@@ -107,13 +110,14 @@ AES单块加密流程：`AddRoundKey → SubBytes → ShiftRows → MixColumns�
 | Stage3 | `CopyOut()` | 出队解密结果，写回GM |
 
 参数配置：
-- `TOTAL_LENGTH` = 8192 (half单元)，对应16384字节
-- `USE_CORE_NUM` = 8（8核并行）
-- `BLOCK_LENGTH` = TOTAL_LENGTH / 8 = 1024
-- `TILE_NUM` = 8，`BUFFER_NUM` = 2（双缓冲）
-- `TILE_LENGTH` = BLOCK_LENGTH / 8 / 2 = 64
+- `BUFFER_NUM` = 2（双缓冲）
+- `TILE_LENGTH` = 64（固定tile大小，用于pipeline buffer分配）
 
-每个核根据`blockIdx`对计数器做偏移，实现多核独立处理不同数据段。
+**早期版本存在16KB数据量限制**：原始kernel硬编码了`TOTAL_LENGTH = 8192`(half单元，对应16384字节)、`USE_CORE_NUM=8`、`BLOCK_LENGTH=1024`等编译期常量，导致单次调用最多处理16384字节。
+
+**已修复**：从tiling参数`totalLength`动态计算每核分块大小(`thisBlockLen_`)，pipeline迭代次数(`loopCount_`)自适应调整，支持任意数据量（从1字节到2GB均通过验证）。
+
+每个核根据`blockIdx`对计数器做偏移，实现多核独立处理不同数据段。最后一块数据可能不足一个完整tile，由`GetTileLen()`函数处理边界情况。
 
 ### 算子原型定义
 
@@ -175,7 +179,7 @@ bash build.sh
 
 ### 关键文件
 
-- `src/main.cpp` — 主程序：初始化资源、创建算子描述、设置输入、执行算子、写出输出
+- `src/main.cpp` — 主程序：初始化资源、创建算子描述、设置输入、执行算子、写出输出（已修改为根据输入文件大小动态设置tensor形状）
 - `src/op_runner.cpp` — OpRunner：封装ACLNN调用流程（`aclnnAesCtrDecryptGetWorkspaceSize` / `aclnnAesCtrDecrypt`）
 - `scripts/gen_data.py` — 使用PyCryptodome生成测试数据和golden数据
 - `scripts/verify_result.py` — 逐字节比较输出与golden
@@ -258,11 +262,12 @@ python3 test_ops_custom_benchmark.py      # 性能profiling
 
 | 项目 | 说明 |
 |------|------|
- | NPU | Ascend910 |
-| PyTorch | 2.1.0 |
+| NPU | Ascend 310P3 |
+| PyTorch | 2.1.0 + torch_npu |
+| CANN | 8.0.0 |
 | Python | 3.9 |
-| 系统架构 | AArch64 |
-| CANN | 8.1.RC |
+| 算子类型 | AI-CORE (Ascend C, TQue Pipeline, 8 core) |
+| 编译模式 | `jit_compile=False`（避免首次编译开销） |
 
 ### 基准测试脚本
 
@@ -274,14 +279,6 @@ python3 test_ops_custom_benchmark.py      # 性能profiling
 
 ```bash
 python3 benchmark_aes_ctr.py
-```
-
-输出示例：
-```
-   1 KB | avg:    0.45 ms | throughput:   2.22 MB/s | PASS
-   4 KB | avg:    0.62 ms | throughput:   6.45 MB/s | PASS
-  ...
-  16 MB | avg:  120.34 ms | throughput: 133.05 MB/s | PASS
 ```
 
 **ACLNN模式固定数据量测试** (`benchmark_fixed.py`)：
@@ -300,6 +297,14 @@ prof.stop()
 prof.export_chrome_trace('./trace/chrome_trace_*.json')
 ```
 
+**大尺寸性能测试** (`benchmark_large_sizes.py`)：
+
+覆盖 1MB ~ 2GB 的大数据量范围，使用 PyTorch 调用 `torch_npu.npu_aes_ctr_decrypt()`，每次 warmup 3 轮后测量 5 轮取统计值，通过 PyCryptodome 验证正确性：
+
+```bash
+/root/miniconda3/envs/operator-dev/bin/python3 benchmark_large_sizes.py
+```
+
 ### 性能profiling
 
 ACLNN模式下`run.sh`自动调用`msprof op`进行profiling：
@@ -310,16 +315,56 @@ msprof op --output=./benchmark_output execute_add_op
 
 PyTorch模式下通过`torch_npu.profiler.profile`采集算子级性能数据，可在Chrome浏览器`chrome://tracing`中打开trace文件进行分析，观察算子执行时间、算子下发调度、Stream同步等细节。
 
-### 性能对比
+### Kernel 16KB限制修复
 
-| 数据量 | ACLNN平均耗时 | 吞吐量 |
-|--------|---------------|--------|
-| 1 KB | ~0.45 ms | ~2.22 MB/s |
-| 16 KB | ~0.68 ms | ~23.53 MB/s |
-| 1 MB | ~8.50 ms | ~117.65 MB/s |
-| 16 MB | ~120.34 ms | ~133.05 MB/s |
+**问题**：原始kernel硬编码了`TOTAL_LENGTH = 8192` half单元（=16384字节），所有缓冲区大小和迭代次数均为编译期常量，无法处理大于16KB的数据。
 
-随着数据量增大，吞吐量趋于稳定，接近NPU带宽上限。小数据量时瓶颈主要在算子下发和启动开销。
+**修复内容**（`op_kernel/aes_ctr_decrypt.cpp`）：
+1. 移除编译期常量 `TOTAL_LENGTH`、`USE_CORE_NUM`、`BLOCK_LENGTH`、`TILE_NUM`
+2. `Init()`方法改为根据tiling传入的`totalLength`动态计算每核分块大小
+3. `Process()`循环次数改为动态计算
+4. 新增`GetTileLen()`处理最后不完整tile的边界
+5. 新增成员变量`thisBlockLen_`和`loopCount_`
+
+修复后单次kernel调用支持从1字节到2GB任意数据量。
+
+### 大尺寸性能测试结果
+
+| 数据量 | 平均耗时(ms) | 最小(ms) | 最大(ms) | 吞吐(MB/s) |
+|--------|-------------|---------|---------|-----------|
+| 1M     | 13.00      | 12.94   | 13.06   | 76.90     |
+| 2M     | 25.59      | 25.58   | 25.61   | 78.15     |
+| 4M     | 51.10      | 51.09   | 51.14   | 78.27     |
+| 8M     | 102.14     | 102.10  | 102.19  | 78.32     |
+| 16M    | 207.92     | 207.88  | 208.04  | 76.95     |
+| 32M    | 415.44     | 415.36  | 415.58  | 77.03     |
+| 64M    | 830.68     | 830.62  | 830.76  | 77.05     |
+| 128M   | 1661.73    | 1661.64 | 1661.85 | 77.03     |
+| 256M   | 3321.38    | 3320.90 | 3321.73 | 77.08     |
+| 512M   | 6638.62    | 6636.68 | 6640.47 | 77.12     |
+| 1G     | 13273.67   | 13265.15 | 13278.93 | 77.15   |
+| 2G     | 26545.99   | 26535.23 | 26565.01 | 77.15   |
+
+**关键发现**：
+- 耗时与数据量呈完美线性关系，吞吐稳定在 **~77 MB/s**
+- 1GB 解密约需 13.3 秒，2GB 约需 26.5 秒
+- 单次kernel launch即可处理2GB数据，无kernel launch瓶颈
+- 小数据量时（< 1MB），kernel launch启动开销占主导（~80-190us）
+
+### Trace数据分析
+
+`PytorchInvocation/trace/`目录下包含16个Chrome Trace文件，记录了多次profiling结果。
+
+**首次JIT编译开销**：
+- 编译耗时 78~618ms（环境差异较大）
+- 稳态后kernel仅 ~80-190us
+- 编译开销约为稳态的 600~5000x
+- `jit_compile=False` 可使首次调用降至 ~0.5ms
+
+**数据搬运开销**：
+完整wrapper调用（`custom_aes_ctr_encrypt`）包含 H2D传输 + NPU kernel + D2H传输，其中传输开销约占 85-90%，kernel本身仅占 10-15%。
+
+详细分析见 `PytorchInvocation/trace/PERF_ANALYSIS.md`。
 
 ## 注意事项
 
