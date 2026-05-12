@@ -29,7 +29,7 @@ AesCtrDecrypt/                     # 算子工程根目录
 │   └── aes_ctr_decrypt.cpp        # AI-CORE Kernel 实现
 ├── build.sh                       # 编译脚本
 ├── CMakeLists.txt                 # CMake 构建配置
-└── OP_DEV_GUIDE.md                # 本文件
+└── op_dev_guide.md                # 本文件
 ```
 
 Host 侧和 Device 侧代码运行在完全不同的处理器上：
@@ -137,6 +137,52 @@ context->SetBlockDim(8);
 
 告诉框架本算子使用 8 个 AI Core 并行。kernel 侧通过 `AscendC::GetBlockNum()` 获取此值。
 
+### 2.4 Tiling vs Block：概念澄清
+
+这是 NPU 开发中最容易混淆的两个概念，它们的区别如下：
+
+| 概念 | 本质 | 代码位置 | 作用 |
+|------|------|---------|------|
+| **Tiling** | Host→Device 的参数传递机制 | `op_host/tiling` + `GET_TILING_DATA` | 把数据大小、分块策略等**计算参数**传给 kernel |
+| **Block** | NPU 的物理 AI Core 执行单元 | `SetBlockDim(N)` + `GetBlockIdx()` | 指定**并行度**，每个 Block 跑一份 kernel |
+| **BlockDim** | 并行核数 | `context->SetBlockDim(8)` | 告诉框架开 8 个核 |
+| **BlockIdx** | 当前核的编号 | `AscendC::GetBlockIdx()` | 每个核据此决定处理哪段数据 |
+
+**一句话区分**：
+
+- **Tiling 解决"数据太大一次装不下"的问题** — 分块 + 参数传递
+- **Block 解决"如何多核加速"的问题** — 8 核并行执行
+
+**两者如何配合**：
+
+```
+TilingFunc (Host)
+  │
+  ├── SetBlockDim(8)  ──────→ 框架启动 8 个 Block
+  │                             每个 Block 执行一份 kernel
+  │
+  ├── tiling.set_totalLength()
+  ├── tiling.set_tileNum()
+  │       │
+  │       ▼ SaveToBuffer(buffer)
+  │             │
+  │             │   tiling buffer (GM 中的一块内存)
+  │             │
+  ▼             ▼
+GET_TILING_DATA(tiling_data, tiling)  — 每个 Block 各自反序列化
+       │
+       │  tiling_data.totalLength — 告诉 Block：总数据量多大
+       │  tiling_data.tileNum     — 告诉 Block：怎么分 tile
+       │
+       ▼
+  Init() 中用 GetBlockIdx() 计算本核要处理的数据段
+```
+
+**类比**：
+- **Tiling** = 施工图纸（告诉工人要盖多大的房子、用什么材料）
+- **Block** = 工人数量（8 个工人同时施工）
+- **BlockIdx** = 工人的编号（工人1负责东侧，工人2负责西侧...）
+
 ---
 
 ## 3. Device 侧代码详解
@@ -154,20 +200,43 @@ context->SetBlockDim(8);
 - 容量小（几十 KB），延迟低（几个周期）
 - 计算必须在 Local Memory 中完成
 
-**half 数据类型的使用**：
+**为什么需要 half？**
 
-Ascend C 的 `LocalTensor<T>` 使用 `half`（16 位浮点）作为基本存储单元。但 AES 处理的是 8 位字节数据。解决方法是将两个 uint8 打包成一个 half：
+核心原因：NPU 的 `DataCopy` 硬件引擎（GM ↔ Local 数据搬运）设计为**以 half（16 位）作为基本传输单元**。虽然可以声明 `LocalTensor<uint8_t>`，但底层 DMA 仍按 16 位对齐搬运，效率最高。所以 GM 和 Local Memory 间的所有数据交换都通过 `half*` 指针进行。
+
+**数据流全景：**
 
 ```
-uint8[0]  uint8[1]           half
-0xAB      0xCD      →    0xCDAB (16-bit)
-↑低字节    ↑高字节
+GM (uint8 数组)
+┌────┬────┬────┬────┬────┬────┐
+│0xAB│0xCD│0x12│0x34│0x56│0x78│  ← 原始数据是 uint8
+└────┴────┴────┴────┴────┴────┘
+      │
+      │ DataCopy 以 half 为单位传输
+      ▼
+Local Memory (half 数组)
+┌──────────┬──────────┬──────────┐
+│ 0xCDAB   │ 0x3412   │ 0x7856   │  ← 两个 uint8 打包成一个 half
+└──────────┴──────────┴──────────┘
+      │
+      │ Compute 时拆包为 uint8[]
+      ▼
+plainBuf (uint8 数组，可做 AES 字节运算)
+┌────┬────┬────┬────┬────┬────┐
+│0xAB│0xCD│0x12│0x34│0x56│0x78│
+└────┴────┴────┴────┴────┴────┘
+      │
+      │ AES 计算完成后再打包回 half
+      ▼
+Local Memory → DataCopy → GM
 ```
 
-在 `Compute()` 阶段：
+这种"用 half 传输、拆 uint8 计算"的模式在 Ascend C 开发中非常常见，是 NPU 硬件特性决定的。
+
+在 `Compute()` 阶段的代码实现：
 
 ```cpp
-// half → uint8[]（解包）
+// half → uint8[]（解包）：遍历每个 half，拆分出两个 uint8
 for (int i = 0; i < tileLen; i++) {
     half hVal = plainLocal.GetValue(i);
     uint16_t halfBits = *reinterpret_cast<uint16_t *>(&hVal);
@@ -175,7 +244,7 @@ for (int i = 0; i < tileLen; i++) {
     plainBuf[2*i + 1] = (halfBits >> 8) & 0xFF;  // 高字节
 }
 
-// AES 计算（在 uint8[] 缓冲区上进行）
+// AES 计算（在 uint8[] 缓冲区上进行 byte-level 运算）
 AesCtrEncrypt(plainBuf, cipherBuf, tileBytes, ...);
 
 // uint8[] → half（打包）
@@ -236,30 +305,76 @@ outQueueCipher.FreeTensor(cipherLocal);
 
 ### 3.3 多核并行与 IV 偏移
 
-本算子使用 8 个 AI Core 并行处理。每个核处理一部分数据，关键是**每个核必须使用不同的密钥流**。
+本算子使用 8 个 AI Core 并行处理。多核并行的配置涉及**两个地方**：
 
-**数据分配**：
+#### 3.3.1 多核并行的参数设置
+
+**位置 1（Host 侧 TilingFunc）— 告诉框架用多少核：**
+
+```cpp
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    context->SetBlockDim(8);   // ← 设置并行核数，固定为 8
+    ...
+}
+```
+
+`SetBlockDim(8)` 告诉 CANN 框架：本算子需要 8 个 AI Core 并行执行。框架收到这个信息后，会在 NPU 上同时启动 8 个 kernel 实例，每个实例运行在**不同的物理 AI Core** 上。
+
+**位置 2（Device 侧 Init）— 每个核知道自己是谁：**
+
+```cpp
+__aicore__ inline void Init(...)
+{
+    int32_t blockDim = AscendC::GetBlockNum();  // = 8（从 SetBlockDim 传来）
+    int32_t blockIdx = AscendC::GetBlockIdx();  // = 0, 1, ..., 7（当前核编号）
+    ...
+}
+```
+
+- `GetBlockNum()`: 总核数，由 Host 侧的 `SetBlockDim(8)` 决定，固定为 8
+- `GetBlockIdx()`: 当前核的编号（0 ~ 7），由 NPU 硬件自动分配
+
+两个函数配合，让每个核知道自己该处理哪段数据。
+
+#### 3.3.2 数据分配
+
+每个核通过 `GetBlockIdx()` 计算出自己在 GM 中的起始位置和块长度：
+
+```cpp
+// 数据均分到各核，余数分配给前几个核
+int32_t baseBlockLen = totalHalfs / blockDim;       // 每核基准 half 数
+int32_t rem = totalHalfs % blockDim;                 // 余数
+int32_t startOffset = blockIdx * baseBlockLen
+                    + (blockIdx < rem ? blockIdx : rem);  // 本核起始偏移
+thisBlockLen_ = baseBlockLen + (blockIdx < rem ? 1 : 0);  // 本核处理量
+
+// 各核指向 GM 中的不同位置
+plaintextGm.SetGlobalBuffer((__gm__ half *)plaintext + startOffset, thisBlockLen_);
+ciphertextGm.SetGlobalBuffer((__gm__ half *)ciphertext + startOffset, thisBlockLen_);
+```
+
+**示意图**（8 核处理 N 个 half 的数据）：
 
 ```
-GM 数据（half 数组）
-┌──────────────────────────────────────────────┐
-│  核0数据  │  核1数据  │  ...  │  核7数据  │
-│  0~N/8   │ N/8~2N/8  │       │ 7N/8~N   │
-└──────────────────────────────────────────────┘
+GM 数据（half 数组，共 N 个）
+┌──────────────────────────────────────────────────────────┐
+│  核0(Idx=0)  │  核1(Idx=1)  │  ...  │  核7(Idx=7)       │
+│  0 ~ N/8-1   │ N/8 ~ 2N/8-1│       │ 7N/8 ~ N-1        │
+│  start=0     │ start=N/8   │       │ start=7N/8         │
+└──────────────────────────────────────────────────────────┘
 ```
 
-每个核的块大小 = `totalHalfs / 8`，余数分配给前几个核。
+#### 3.3.3 IV 偏移（多核并行的关键）
 
-**IV 偏移计算**：
+CTR 模式的密钥流由 `AES(key, counter)` 生成。如果 8 个核都从 counter=0 开始，它们会生成**相同的密钥流**，导致解密结果全错（相同位置的密文被相同的密钥流异或了多次）。
 
-CTR 模式的密钥流由 AES(key, counter) 生成。如果 8 个核都从 counter=0 开始，它们会生成相同的密钥流，导致解密错误。
-
-解决方法：按核的起始数据位置偏移 counter。
+解决方法：每个核的 counter 从不同的起始值开始，偏移量等于该核之前已经处理的数据量。
 
 ```
-核0 从数据偏移 0 开始 → counter 从 0 开始
-核1 从数据偏移 N/8 开始 → counter 从 N/16 开始（因为每 16 字节 = 1 个 counter）
-核2 从数据偏移 2N/8 开始 → counter 从 2N/16 开始
+核0(Idx=0): startOffset=0   → counter 从 0 开始
+核1(Idx=1): startOffset=N/8 → counter 从 N/16 开始（N/8 halfs = N/4 字节 ÷ 16 = N/16 个 AES 块）
+核2(Idx=2): startOffset=2N/8 → counter 从 2N/16 开始
 ...
 ```
 
@@ -268,9 +383,9 @@ CTR 模式的密钥流由 AES(key, counter) 生成。如果 8 个核都从 count
 ```cpp
 // startOffset 是 half 单位，转为 AES 块数
 // 每个 AES 块 = 16 字节 = 8 个 half
-// 所以偏移块数 = startOffset / 8
+// 偏移块数 = startOffset / 8
 uint32_t offsetBlocks = static_cast<uint32_t>(startOffset / 8);
-BigEndAdd(tmpIV, offsetBlocks);
+BigEndAdd(tmpIV, offsetBlocks);  // 大端加法：tmpIV += offsetBlocks
 ```
 
 ### 3.4 动态分块（16KB 限制修复）
