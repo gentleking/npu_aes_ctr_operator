@@ -506,6 +506,110 @@ NPU 的 AI Core 主要面向矩阵/向量运算（如卷积、Transformer），A
 2. AES 10 轮标量计算的 CPI
 3. GM ↔ Local 数据搬运带宽
 
+## 5.1 优化方向分析
+
+当前吞吐约 77 MB/s，以下是理论上可考虑的优化方向及其可行性：
+
+### 方向 1：消除 half ↔ uint8 转换（收益高，但受硬件约束）
+
+当前每个 tile 都要做 half→uint8 解包和 uint8→half 打包，这是纯软件开销。如果 `LocalTensor<uint8_t>` 能被 `DataCopy` 硬件直接支持，可以省掉这笔开销：
+
+```cpp
+// 理想情况：直接以 uint8 为单位搬运和计算
+AscendC::LocalTensor<uint8_t> plainLocal = inQueuePlain.AllocTensor<uint8_t>();
+AscendC::DataCopy(plainLocal, plaintextGm, tileLen);  // 直接用 uint8 搬运
+// 无需 half↔uint8 转换，直接 AES 计算
+AesCtrEncrypt(plainLocal.GetValue(0), ...);
+```
+
+实际上，当前 Ascend C 的 DataCopy 硬件对 half 支持最好，`uint8_t` 的 LocalTensor 可能被内部提升为 half，或需要手动 `AscendC::ConvertTo`。如果能用原生 uint8 传输，预计可提升 **20-30%**。
+
+### 方向 2：增大 TILE_LENGTH（收益中等）
+
+当前 TILE_LENGTH = 64 halfs（128 字节 / tile），每核的 pipeline 迭代次数较多。增大 TILE_LENGTH 可减少迭代次数，降低 pipeline stage 切换开销：
+
+```
+TILE_LENGTH=64: loopCount = N/64 次迭代
+TILE_LENGTH=256: loopCount = N/256 次迭代（减少 75% 迭代次数）
+```
+
+**风险**：TILE_LENGTH 增大会占用更多 Local Memory。当前每核 LM 占用为 `TILE_LENGTH × sizeof(half) × BUFFER_NUM × 2 个队列 = 64 × 2 × 2 × 2 = 512 字节`。如果 TILE_LENGTH=256，占用 2048 字节，仍在 LM 预算内（通常几十 KB），可以尝试。
+
+### 方向 3：增加 BUFFER_NUM（收益低）
+
+当前 BUFFER_NUM=2 实现乒乓缓冲。增加到 3 或 4 可以更深度隐藏 DataCopy 延迟：
+
+```cpp
+constexpr int32_t BUFFER_NUM = 3;  // 三缓冲
+```
+
+**代价**：多占 50% 的 Local Memory（每增加 1 个 buffer = TILE_LENGTH × sizeof(half) = 128 字节）。在 LM 充足时值得尝试，但预期收益不高（DataCopy 延迟已经可以被 2 缓冲较好地隐藏）。
+
+### 方向 4：用 AI CPU 代替 AI Core（架构级改变）
+
+AES 是典型的标量运算（逐字节查表、异或），AI Core 的矩阵/向量单元几乎用不上。AI CPU（同构 ARM 核）反而更适合这种运算：
+
+对比：
+| 维度 | AI Core | AI CPU |
+|------|---------|--------|
+| AES 标量计算 | 慢（为矩阵优化） | 快（ARM 标量流水线） |
+| 核数 | 8 核 | 2-4 核 |
+| LM 限制 | 几十 KB | 无（直接访问 DDR） |
+| half 转换 | 需要 | 不需要（可直接操作 uint8） |
+
+从当前 ~77 MB/s 的表现来看，这个算子放在 AI CPU 上可能达到更高的吞吐（典型 AI CPU 算子的 AES 吞吐在 150-300 MB/s）。
+
+### 方向 5：S-box 放到常量存储（低收益，省 LM 空间）
+
+当前 S-box 存在 LM 中占 256 字节，可以移到 `__constant__` 只读存储：
+
+```cpp
+__constant__ uint8_t sbox[256] = {0x63, 0x7c, ...};
+```
+
+释放出的 LM 空间可用于增大 TILE_LENGTH。但 S-box 查表在 LM 中是最快的（1-2 周期），放到常量存储会增加查表延迟，**仅当 LM 空间不足需要增大 TILE_LENGTH 时才值得做**。
+
+### 方向 6：AES 循环展开（收益低）
+
+AES 10 轮展开成直线代码，减少循环控制开销：
+
+```cpp
+// 展开前
+for (int r = 1; r < AES_ROUND_NUM; r++) {
+    SubShiftMix(state, blockId, sbox);
+    AddRoundKey(state, roundKeys + 16 * r);
+}
+
+// 展开后
+SubShiftMix(state, blockId, sbox); AddRoundKey(state, roundKeys + 16*1);
+SubShiftMix(state, blockId, sbox); AddRoundKey(state, roundKeys + 16*2);
+// ... 10 轮展开
+SubShift(state, sbox); AddRoundKey(state, roundKeys + 16*10);
+```
+
+AES 每轮计算本身就是计算密集的（SubBytes 查表 + ShiftRows + MixColumns），循环控制开销占比极小。**收益可忽略**。
+
+### 优化收益预估
+
+| 优化方向 | 预估收益 | 实现难度 | 风险 |
+|---------|---------|---------|------|
+| 消除 half 转换 | +20~30% | 高（取决于硬件支持） | 可能不支持 |
+| 增大 TILE_LENGTH | +5~15% | 低（改一个数字） | LM 溢出 |
+| 增加 BUFFER_NUM | +0~5% | 低 | LM 占用增加 |
+| 改用 AI CPU | +100~300% | 高（重写算子） | 架构变化 |
+| 常量 S-box | 可有可无 | 低 | 查表变慢 |
+| 循环展开 | <1% | 低 | 代码膨胀 |
+
+### 当前瓶颈定位
+
+从 profilling（`#ifndef ASCENDC_CPU_DEBUG` 编译后通过 msprof 采集）可以精确定位瓶颈在哪个阶段。初步分析：
+
+- **Compute 阶段**：AES 每字节 ~8-10 条标量指令 × 10 轮 × 16 字节 = ~1280-1600 条指令 / 块。这是主要计算时间。
+- **CopyIn/CopyOut 阶段**：DataCopy 带宽通常为几十 GB/s，128 字节的传输约需几十个周期，不是瓶颈。
+- **half 转换**：两个 for 循环各遍历所有字节，是纯软件开销。
+
+**综合建议**：如果追求极致性能，建议将算子迁移到 AI CPU 实现。如果继续使用 AI Core，增大 TILE_LENGTH 是最简单的优化手段。
+
 ---
 
 ## 6. 调试与验证
