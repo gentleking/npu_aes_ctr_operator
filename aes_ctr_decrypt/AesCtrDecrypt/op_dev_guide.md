@@ -570,3 +570,41 @@ Ascend C 的 LocalTensor 内部存储单元是 half。虽然可以创建 `LocalT
 ### Q: 单次 kernel 调用能处理的最大数据量是多少？
 
 理论上没有上限（动态分块后），但受制于 GM 大小（HBM 容量）。在 310P3 上单次调用已验证通过 2GB 数据。
+
+### Q: 算子对数据量有什么约束？必须 16 字节对齐吗？
+
+有两个约束：
+
+**约束 1：字节总数必须为偶数（必须满足）**
+
+kernel 内部用 `totalLength / 2` 将 uint8 元素数转为 half 数。如果 `totalLength` 是奇数，除 2 会截断，最后一个字节被丢弃。原因是 `DataCopy` 和 `GlobalTensor` 均以 half（16 位）为传输单元，两个 uint8 打包成一个 half，奇数个字节无法完整打包。
+
+**约束 2：AES 块大小 16 字节（自动处理，无需关心）**
+
+`AesCtrEncrypt` 中已处理不完整块：
+
+```cpp
+int blockSize = (lengthBytes - offset < 16) ? (lengthBytes - offset) : 16;
+```
+
+最后一块不足 16 字节时，只异或剩余字节数——CTR 模式本身的特性，不需要填充。
+
+**验证**：
+
+```bash
+/root/miniconda3/envs/operator-dev/bin/python3 -c "
+import torch, torch_npu, hashlib
+from Crypto.Cipher import AES
+key = torch.randint(0, 256, (1, 16), dtype=torch.uint8)
+iv = torch.zeros((1, 16), dtype=torch.uint8)
+for size in [18, 34, 50, 100, 1023]:  # 偶数但不是16的倍数
+    p = torch.randint(0, 256, (size,), dtype=torch.uint8)
+    c = AES.new(key.numpy().tobytes(), AES.MODE_CTR, initial_value=iv.numpy().tobytes(), nonce=b'')
+    g = c.encrypt(p.numpy().tobytes())
+    o = torch_npu.npu_aes_ctr_decrypt(p.npu(), key.npu()).cpu()
+    m = hashlib.md5(o.numpy().tobytes()).hexdigest() == hashlib.md5(g).hexdigest()
+    print(f'size={size:>4}B: {\"PASS\" if m else \"FAIL\"}')
+"
+```
+
+结论：**偶数字节即可，不必是 16 的倍数。**
