@@ -549,15 +549,17 @@ constexpr int32_t BUFFER_NUM = 3;  // 三缓冲
 
 当前 AES 所有步骤（SubBytes、ShiftRows、MixColumns、AddRoundKey）都是用**纯标量 C 代码**逐字节执行的，AI Core 的 Vector 单元和 Cube 单元完全没有被利用。
 
+**关键发现**：CANN 9.0.0 的 `Xor` 和 `BitwiseXor` API 内部有 `if ASCEND_IS_AIC { return; }` 判断，在 AI Core 上**直接返回、不做任何操作**。它们仅适用于分离模式下的 Vector Core（AIV），在 310P3 的 AI Core 上不可用。`And`、`Or` 虽可在 AIC 上使用，但仅支持 `int16_t/uint16_t`，且需三次运算（`a OR b` → `a AND b` → `Sub`）才能实现 XOR，收益为负。因此 **Vector XOR 在 310P3 AIC 上不可行**。
+
 ##### AES 各步骤的可向量化分析
 
 AI Core 的 Vector 单元一次可处理 128 字节（256 位或 128 字节取决于具体指令），Cube 单元专攻矩阵乘法。AES 的核心操作是否可以映射到这些硬件单元？
 
 | AES 步骤 | 操作类型 | 可向量化？ | 分析 |
 |---------|---------|-----------|------|
-| **AddRoundKey** | 16 字节 XOR | **✅ 很容易** | XOR 是 Vector 原生指令（`VecXor`），可直接做 128 位 XOR，16 字节一个块，8 个块同时做也只需一次 128 字节 VecXor |
-| **CTR 异或** | 密文 XOR 密钥流 | **✅ 很容易** | 同上，VecXor 一次处理 |
-| **MixColumns** | 4 列独立 GF 运算 | **✅ 可行** | 每列 4 字节，操作相同（xtime + XOR），可拆为向量化的 byte-wise 运算。8 块并行时一次处理 32 列 |
+| **AddRoundKey** | 16 字节 XOR | **❌ AIC 无 VecXor** | `Xor`/`BitwiseXor` API 在 AIC 上为 no-op。`And`/`Or`/`Sub` 可构造 XOR 但需 3 次向量操作，数据需提前转成 int16_t，开销远超收益 |
+| **CTR 异或** | 密文 XOR 密钥流 | **❌ AIC 无 VecXor** | 同上 |
+| **MixColumns** | 4 列独立 GF 运算 | **⚠️ 有条件** | 每列 4 字节，操作相同（xtime + XOR），可拆为向量化的 byte-wise 运算。8 块并行时一次处理 32 列 |
 | **ShiftRows** | 16 字节内置换 | **⚠️ 有条件** | 块内固定置换，如果 Vector 有 `VecPermute` 可一次完成；否则需要分别处理各行 |
 | **SubBytes** | 256 元 S-box 查表 | **❌ 困难** | 这是最核心的瓶颈。S-box 是非线性字节替换，每个字节查同一张 256 元素表。Vector 单元没有 gather/scatter 式的查表指令。如果要向量化，只能用数学公式逼近 S-box（GF(2^8) 求逆 + 仿射变换），但这涉及大量 GF 运算，得不偿失 |
 | **KeyExpansion** | 串行依赖 | **❌ 不可行** | 每轮子密钥依赖前一轮，数据流高度串行 |
@@ -615,13 +617,13 @@ Cube 单元是**矩阵乘法累加器**（`C = A × B + C`），AES 的 AddRound
 
 | 加速手段 | AES 步骤 | 可行度 | 说明 |
 |---------|---------|-------|------|
-| Vector XOR | AddRoundKey、CTR XOR | **直接可用** | 当前可立即修改，把标量 XOR 替换为 VecXor |
+| Vector XOR | AddRoundKey、CTR XOR | **❌ AIC 不可用** | `Xor`/`BitwiseXor` 在 AIC 上为 no-op（仅 AIV 可用）。`And`+`Or`+`Sub` 构造需 3 次向量指令且只能处理 int16_t，收益为负 |
 | Vector permute | ShiftRows | **需要验证** | 需确认 `VecPermute` 是否支持字节级置换 |
 | Vector GF | MixColumns | **需要验证** | 需构造向量化的 xtime + XOR 序列 |
 | 标量查表 | SubBytes | **暂时保持标量** | 无法向量化，最多 8 块并行做 8 组独立查表 |
 | 8 块并行 | 全部步骤 | **架构级改造** | 块间无数据依赖，天然可并行，是收益最大化的基础 |
 
-**预计收益**：如果 SubBytes 外的所有步骤都向量化 + 8 块并行，单次 Vector 指令处理 128 字节，相对当前逐标量处理 128 字节约有 **2-4 倍**的理论加速。但 SubBytes 仍然是拖后腿的瓶颈（256 元素表查表无法向量化），可能使最终加速比缩小到 **1.5-2 倍**。这需要深入的 Ascend C Vector API 验证和实际 profiling。
+**结论**：在 310P3 AI Core 上，由于缺乏向量位运算指令支持，Vector 加速 AES 在此硬件平台上**不可行**。
 
 #### 方向 5：S-box 放到常量存储（低收益，省 LM 空间）
 
@@ -635,8 +637,8 @@ AES 10 轮展开成直线代码，减少循环控制开销。AES 每轮计算本
 
 | 优化方向 | 预估收益 | 实现难度 | 风险 |
 |---------|---------|---------|------|
-| **Vector 加速 AES 步骤** | **+50~200%** | **高** | 需深入 Ascend C Vector API |
-| **增大 TILE_LENGTH** | **+5~15%** | **低** | LM 溢出 |
+| **增大 TILE_LENGTH** | **+5~15%（实测+4.8%）** | **低** | LM 溢出 |
+| **Vector 加速 AES 步骤** | **AIC 上不可行** | — | `Xor`/`BitwiseXor` 在 AIC 上为 no-op |
 | 消除 half 转换 | +20~30% | 高（取决于硬件支持） | 可能不支持 |
 | 增加 BUFFER_NUM | +0~5% | 低 | LM 占用增加 |
 | S-box 常量存储 | 换 LM 空间 | 低 | 查表变慢 |
