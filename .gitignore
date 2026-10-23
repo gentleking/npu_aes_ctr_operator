@@ -19,3 +19,11 @@ test/test_aclop_v2
 test/test_execute_op
 test/2026*/
 test/fusion_result.json
+packages/
+**/PytorchInvocation/models/
+**/PytorchInvocation/trace/
+**/PytorchInvocation/export_only_prof_dir/
+**/PytorchInvocation/extra-info/
+**/PytorchInvocation/*.whl
+*.pth
+*.whl
